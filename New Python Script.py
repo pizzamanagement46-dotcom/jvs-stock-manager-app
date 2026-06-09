@@ -393,27 +393,40 @@ elif page == "🏪 Storage Count":
                     header = st.columns([3,2,2,2,2,2,3])
                     for h, col in zip(["Product","MIH","RCV","DRP","EXC","NOTE","Balance"], header):
                         col.markdown(f"**{h}**")
+                    def _sg_num(x):
+                        try:    return float(x)
+                        except: return 0.0
+                    def _sg_fmt(v):
+                        if str(v).strip() == "": return ""
+                        f = _sg_num(v)
+                        return str(int(f)) if f == int(f) else str(f)
+
                     new_vals = {}
+                    new_mih  = {}
                     for prod in store_products:
-                        existing = (storage_qty.get(sel_store,{})
-                                    .get(prod,{}).get("daily",{}).get(date_key,{}))
+                        pinfo    = storage_qty.get(sel_store,{}).get(prod,{})
+                        existing = pinfo.get("daily",{}).get(date_key,{})
                         cols = st.columns([3,2,2,2,2,2,3])
                         cols[0].markdown(f"**{prod}**")
-                        mih  = cols[1].text_input("", value=existing.get("mih",""),  key=f"mih_{prod}_{date_key}", label_visibility="collapsed")
-                        rcv  = cols[2].text_input("", value=existing.get("rcv",""),  key=f"rcv_{prod}_{date_key}", label_visibility="collapsed")
-                        drp  = cols[3].text_input("", value=existing.get("drp",""),  key=f"drp_{prod}_{date_key}", label_visibility="collapsed")
-                        exc  = cols[4].text_input("", value=existing.get("exc",""),  key=f"exc_{prod}_{date_key}", label_visibility="collapsed")
-                        note = cols[5].text_input("", value=existing.get("note",""), key=f"nt_{prod}_{date_key}",  label_visibility="collapsed")
-                        try:    bal_str = str(int(mih or 0)+int(rcv or 0)-int(drp or 0)+int(exc or 0))
-                        except: bal_str = "?"
+                        mih  = cols[1].text_input("", value=_sg_fmt(pinfo.get("must_in_hand","")), key=f"mih_{prod}_{date_key}", label_visibility="collapsed")
+                        rcv  = cols[2].text_input("", value=_sg_fmt(existing.get("received","")),  key=f"rcv_{prod}_{date_key}", label_visibility="collapsed")
+                        drp  = cols[3].text_input("", value=_sg_fmt(existing.get("dropped","")),   key=f"drp_{prod}_{date_key}", label_visibility="collapsed")
+                        exc  = cols[4].text_input("", value=_sg_fmt(existing.get("exchange","")),  key=f"exc_{prod}_{date_key}", label_visibility="collapsed")
+                        note = cols[5].text_input("", value=str(existing.get("note","")),          key=f"nt_{prod}_{date_key}",  label_visibility="collapsed")
+                        bal_val = _sg_num(rcv) - _sg_num(drp) + _sg_num(exc)
+                        bal_str = str(int(bal_val)) if bal_val == int(bal_val) else str(round(bal_val,2))
                         cols[6].markdown(f"**{bal_str}**")
-                        new_vals[prod] = {"mih":mih,"rcv":rcv,"drp":drp,"exc":exc,"note":note,"balance":bal_str}
+                        new_vals[prod] = {"received":rcv, "dropped":drp, "exchange":exc, "note":note}
+                        new_mih[prod]  = mih
 
                     if st.form_submit_button("💾 Save Storage Data", use_container_width=True):
                         sq = data.setdefault("storage_qty",{})
                         sq.setdefault(sel_store,{})
                         for prod, vals in new_vals.items():
-                            sq[sel_store].setdefault(prod,{}).setdefault("daily",{})[date_key] = vals
+                            pnode = sq[sel_store].setdefault(prod,{})
+                            pnode.setdefault("daily",{})[date_key] = vals
+                            if str(new_mih.get(prod,"")).strip() != "":
+                                pnode["must_in_hand"] = new_mih[prod]
                         persist()
                         st.success(f"✅ Saved for {sel_store} on {date_key}")
                         st.rerun()
@@ -497,8 +510,13 @@ elif page == "📤 Drop Stock":
                     date_key = drop_date.strftime("%Y-%m-%d")
                     sq = data.setdefault("storage_qty",{})
                     sq.setdefault(drop_store,{}).setdefault(drop_prod,{}).setdefault("daily",{}).setdefault(date_key,{})
-                    existing_drp = int(sq[drop_store][drop_prod]["daily"][date_key].get("drp",0) or 0)
-                    sq[drop_store][drop_prod]["daily"][date_key]["drp"] = str(existing_drp + drop_qty)
+                    _cell = sq[drop_store][drop_prod]["daily"][date_key]
+                    try:    existing_drp = float(_cell.get("dropped",0) or 0)
+                    except: existing_drp = 0.0
+                    _cell["dropped"] = str(existing_drp + drop_qty)
+                    _cell.setdefault("received","")
+                    _cell.setdefault("exchange","")
+                    _cell.setdefault("note","")
                     persist(); st.success(f"✅ Dropped {drop_qty} × {drop_prod}"); st.rerun()
 
     with tab2:
@@ -530,6 +548,7 @@ elif page == "📤 Drop Stock":
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "🕐 Shift Sale":
     st.title("🕐 Shift Wise Sale")
+    import pandas as pd
     stores = data.get("stores_list",[]) or data.get("storage_stores",[])
     if not stores:
         st.warning("No stores configured. Add stores in Storage Count first.")
@@ -540,41 +559,73 @@ elif page == "🕐 Shift Sale":
         date_key   = sel_date.strftime("%Y-%m-%d")
         st.markdown(f"### 🏪 {sel_store} — {date_key}")
 
-        tab_m, tab_e, tab_n = st.tabs(["🌅 Morning","🌆 Evening","🌙 Night"])
-        for shift, tab in zip(SHIFTS, [tab_m, tab_e, tab_n]):
-            with tab:
-                shift_key = f"{sel_store}_{date_key}_{shift}"
-                existing  = data.get("daily_shift_data",{}).get(shift_key,{})
-                with st.form(key=f"shift_{shift_key}"):
-                    c1,c2,c3 = st.columns(3)
-                    opening = c1.number_input("Opening Balance", value=int(existing.get("opening",0) or 0), min_value=0)
-                    sales   = c2.number_input("Sales",           value=int(existing.get("sales",0)   or 0), min_value=0)
-                    closing = c3.number_input("Closing Balance", value=int(existing.get("closing",0)  or 0), min_value=0)
-                    notes   = st.text_input("Notes", value=existing.get("notes",""))
-                    expected = opening - sales
-                    diff     = closing - expected
-                    st.markdown(f"**Expected Closing:** {expected}  |  **Difference:** {'+'if diff>=0 else ''}{diff}")
-                    if st.form_submit_button(f"💾 Save {shift} Shift", use_container_width=True):
-                        data.setdefault("daily_shift_data",{})[shift_key] = {
-                            "opening":opening,"sales":sales,"closing":closing,
-                            "notes":notes,"ts":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        }
-                        persist(); st.success(f"✅ {shift} shift saved"); st.rerun()
+        shift_products = data.get("store_products",{}).get(sel_store,[])
 
-        st.divider()
-        st.subheader("📊 Daily Summary")
-        import pandas as pd
-        summary_rows = []
-        total_sales  = 0
-        for shift in SHIFTS:
-            sk = f"{sel_store}_{date_key}_{shift}"
-            sd = data.get("daily_shift_data",{}).get(sk,{})
-            s  = int(sd.get("sales",0) or 0)
-            total_sales += s
-            summary_rows.append({"Shift":shift,"Opening":sd.get("opening","-"),
-                                  "Sales":s,"Closing":sd.get("closing","-"),"Notes":sd.get("notes","")})
-        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-        st.metric("Total Sales Today", total_sales)
+        def _sn(x):
+            try:    return float(x)
+            except: return 0.0
+        def _fmt(v):
+            if str(v).strip() == "": return ""
+            f = _sn(v)
+            return str(int(f)) if f == int(f) else str(round(f,2))
+
+        if not shift_products:
+            st.info(f"No products assigned to **{sel_store}**. Assign products to this store first.")
+        else:
+            tab_m, tab_e, tab_n = st.tabs(["🌅 Morning","🌆 Evening","🌙 Night"])
+            for shift, tab in zip(SHIFTS, [tab_m, tab_e, tab_n]):
+                with tab:
+                    shift_node = (data.get("daily_shift_data",{})
+                                  .get(sel_store,{}).get(date_key,{}).get(shift,{}))
+                    with st.form(key=f"shift_{sel_store}_{date_key}_{shift}"):
+                        header = st.columns([4,2,2,2,2])
+                        for h, col in zip(["Product","Drop","Start","End","Sale"], header):
+                            col.markdown(f"**{h}**")
+                        new_rows = {}
+                        shift_total = 0.0
+                        for prod in shift_products:
+                            ex   = shift_node.get(prod,{})
+                            cols = st.columns([4,2,2,2,2])
+                            cols[0].markdown(f"**{prod}**")
+                            dv = cols[1].text_input("", value=_fmt(ex.get("drop","")),  key=f"d_{shift}_{prod}_{date_key}", label_visibility="collapsed")
+                            sv = cols[2].text_input("", value=_fmt(ex.get("start","")), key=f"s_{shift}_{prod}_{date_key}", label_visibility="collapsed")
+                            ev = cols[3].text_input("", value=_fmt(ex.get("end","")),   key=f"e_{shift}_{prod}_{date_key}", label_visibility="collapsed")
+                            any_filled = any(str(x).strip() != "" for x in (dv, sv, ev))
+                            sale_val   = _sn(sv) + _sn(dv) - _sn(ev)
+                            sale_str   = (str(int(sale_val)) if sale_val == int(sale_val) else str(round(sale_val,2))) if any_filled else ""
+                            cols[4].markdown(f"**{sale_str}**")
+                            shift_total += sale_val if any_filled else 0.0
+                            new_rows[prod] = {"drop":dv, "start":sv, "end":ev,
+                                              "sale": (sale_val if any_filled else "")}
+                        st.markdown(f"**{shift} total sale:** {shift_total:g}")
+                        if st.form_submit_button(f"💾 Save {shift} Shift", use_container_width=True):
+                            dsd = data.setdefault("daily_shift_data",{})
+                            dsd.setdefault(sel_store,{}).setdefault(date_key,{})[shift] = new_rows
+                            persist(); st.success(f"✅ {shift} shift saved"); st.rerun()
+
+            st.divider()
+            st.subheader("📊 Daily Summary (sale per product, all shifts)")
+            day_node = data.get("daily_shift_data",{}).get(sel_store,{}).get(date_key,{})
+            summary_rows = []
+            grand_total  = 0.0
+            for prod in shift_products:
+                row        = {"Product": prod}
+                prod_total = 0.0
+                has        = False
+                for shift in SHIFTS:
+                    sale = day_node.get(shift,{}).get(prod,{}).get("sale","")
+                    row[shift] = _fmt(sale)
+                    prod_total += _sn(sale)
+                    if str(sale).strip() != "": has = True
+                row["Total"] = (str(int(prod_total)) if prod_total == int(prod_total) else str(round(prod_total,2)))
+                grand_total += prod_total
+                if has:
+                    summary_rows.append(row)
+            if summary_rows:
+                st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+            else:
+                st.info("No shift entries recorded for this store and date yet.")
+            st.metric("Total Sale Today (all products × all shifts)", f"{grand_total:g}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
