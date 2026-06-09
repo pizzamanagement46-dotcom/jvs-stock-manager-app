@@ -85,6 +85,45 @@ def get_supabase():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# GOOGLE SHEETS CONNECTION (push data into your existing sheet)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_gsheet_client():
+    """
+    Returns an authorised gspread client using the service-account JSON
+    stored in Streamlit secrets under key 'gcp_service_account_json'.
+    Returns None if the secret isn't set or libraries are missing.
+    """
+    try:
+        import json as _json
+        import gspread
+        from google.oauth2.service_account import Credentials
+        raw   = st.secrets["gcp_service_account_json"]
+        info  = _json.loads(raw) if isinstance(raw, str) else dict(raw)
+        scopes = ["https://www.googleapis.com/auth/spreadsheets",
+                  "https://www.googleapis.com/auth/drive"]
+        creds = Credentials.from_service_account_info(info, scopes=scopes)
+        return gspread.authorize(creds)
+    except Exception:
+        return None
+
+
+def _write_ws(sheet, title, header, rows):
+    """Create or reuse a worksheet, clear it, and write header + rows in one call."""
+    import gspread
+    n_rows = max(len(rows) + 10, 50)
+    n_cols = max(len(header) + 2, 8)
+    try:
+        ws = sheet.worksheet(title)
+        ws.clear()
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=title, rows=n_rows, cols=n_cols)
+    values = [header] + rows
+    ws.update(values=values, range_name="A1")
+    return len(rows)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # DATA LAYER  — reads/writes a single JSON blob stored in Supabase
 # (table: app_data, columns: id TEXT primary key, payload JSONB)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -857,9 +896,143 @@ elif page == "📒 Ledger":
                                          row.get("qty",""),row.get("note",""),row.get("ts","")],1):
                     c=ws4.cell(row=i,column=ci,value=val); c.fill=fill; c.alignment=ctr
 
+            # ── Shift Sale (product-level, every store/date/shift) ──────────────
+            ws5 = wb.create_sheet("Shift Sale")
+            for ci,h in enumerate(["Store","Date","Shift","Product","Drop","Start","End","Sale"],1):
+                c=ws5.cell(row=1,column=ci,value=h); c.fill=hfil; c.font=hfnt; c.alignment=ctr
+            r = 2
+            dsd = data.get("daily_shift_data",{})
+            for store in sorted(dsd.keys()):
+                dates = dsd[store]
+                for dkey in sorted(dates.keys()):
+                    for shift in ["Morning","Evening","Night"]:
+                        prods = dates[dkey].get(shift,{})
+                        for prod, v in prods.items():
+                            if not any(str(v.get(k,"")).strip() for k in ("drop","start","end","sale")):
+                                continue
+                            fill = even if r%2==0 else odd
+                            for ci,val in enumerate([store,dkey,shift,prod,
+                                                     v.get("drop",""),v.get("start",""),
+                                                     v.get("end",""),v.get("sale","")],1):
+                                c=ws5.cell(row=r,column=ci,value=val); c.fill=fill; c.alignment=ctr
+                            r += 1
+
+            # ── Storage Count (every store/product/date) ────────────────────────
+            ws6 = wb.create_sheet("Storage Count")
+            for ci,h in enumerate(["Store","Product","Date","Must In Hand","Received","Dropped","Exchange","Note"],1):
+                c=ws6.cell(row=1,column=ci,value=h); c.fill=hfil; c.font=hfnt; c.alignment=ctr
+            r = 2
+            sq = data.get("storage_qty",{})
+            for store in sorted(sq.keys()):
+                for prod in sorted(sq[store].keys()):
+                    pinfo = sq[store][prod]
+                    mih   = pinfo.get("must_in_hand","")
+                    daily = pinfo.get("daily",{})
+                    for dkey in sorted(daily.keys()):
+                        v = daily[dkey]
+                        if not any(str(v.get(k,"")).strip() for k in ("received","dropped","exchange","note")):
+                            continue
+                        fill = even if r%2==0 else odd
+                        for ci,val in enumerate([store,prod,dkey,mih,
+                                                 v.get("received",""),v.get("dropped",""),
+                                                 v.get("exchange",""),v.get("note","")],1):
+                            c=ws6.cell(row=r,column=ci,value=val); c.fill=fill; c.alignment=ctr
+                        r += 1
+
             buf=io.BytesIO(); wb.save(buf); buf.seek(0)
             st.download_button("⬇️ Download Excel File", buf,
                 file_name=f"stock_export_{date.today()}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True)
             st.success("✅ Excel ready! Click Download above.")
+
+        st.divider()
+        st.subheader("☁️ Sync to Google Sheet")
+        gs_id = data.get("gs_sheet_id", "")
+        if not gs_id:
+            st.info("No Google Sheet ID saved in your data.")
+        else:
+            st.caption(f"Target sheet ID: …{gs_id[-12:]}")
+        if st.button("🔄 Push All Data to Google Sheet", use_container_width=True):
+            gc = get_gsheet_client()
+            if gc is None:
+                st.error("❌ Google not connected. Add 'gcp_service_account_json' to "
+                         "Streamlit Secrets, then try again.")
+            elif not gs_id:
+                st.error("❌ No Google Sheet ID found in your data.")
+            else:
+                try:
+                    sheet = gc.open_by_key(gs_id)
+
+                    # 1) Stock Ledger
+                    led_rows = [[t.get("date",""), t.get("product",""),
+                                 t.get("type","").capitalize(), t.get("qty",""),
+                                 t.get("source",""), t.get("notes","")]
+                                for t in sorted(stock_transactions(),
+                                                key=lambda x:(x.get("date",""), x.get("ts","")))]
+                    # 2) Product Summary
+                    sum_rows = []
+                    for prod, meta in sorted(ledger_products().items()):
+                        bal = ledger_stock_balance(prod); price = float(meta.get("price",0))
+                        sum_rows.append([prod, price, meta.get("unit","pcs"), bal, round(bal*price,2)])
+                    # 3) Payments
+                    pay_rows = [[p.get("date",""), p.get("product","(General)"),
+                                 p.get("description",""), p.get("amount",0), p.get("notes","")]
+                                for p in sorted(ledger_payments(),
+                                                key=lambda x:(x.get("date",""), x.get("ts","")))]
+                    # 4) Drop Log
+                    drop_rows = [[r.get("date",""), r.get("store",""), r.get("product",""),
+                                  r.get("qty",""), r.get("note",""), r.get("ts","")]
+                                 for r in sorted(data.get("drop_log",[]), key=lambda x:x.get("ts",""))]
+                    # 5) Shift Sale (product level)
+                    shift_rows = []
+                    dsd = data.get("daily_shift_data",{})
+                    for store in sorted(dsd.keys()):
+                        for dkey in sorted(dsd[store].keys()):
+                            for shift in SHIFTS:
+                                for prod, v in dsd[store][dkey].get(shift,{}).items():
+                                    if not any(str(v.get(k,"")).strip() for k in ("drop","start","end","sale")):
+                                        continue
+                                    shift_rows.append([store, dkey, shift, prod,
+                                                       v.get("drop",""), v.get("start",""),
+                                                       v.get("end",""), v.get("sale","")])
+                    # 6) Storage Count
+                    stor_rows = []
+                    sq = data.get("storage_qty",{})
+                    for store in sorted(sq.keys()):
+                        for prod in sorted(sq[store].keys()):
+                            pinfo = sq[store][prod]; mih = pinfo.get("must_in_hand","")
+                            for dkey in sorted(pinfo.get("daily",{}).keys()):
+                                v = pinfo["daily"][dkey]
+                                if not any(str(v.get(k,"")).strip() for k in ("received","dropped","exchange","note")):
+                                    continue
+                                stor_rows.append([store, prod, dkey, mih,
+                                                  v.get("received",""), v.get("dropped",""),
+                                                  v.get("exchange",""), v.get("note","")])
+
+                    tables = [
+                        ("Stock Ledger",   ["Date","Product","Type","Qty","Source","Notes"], led_rows),
+                        ("Product Summary",["Product","Price","Unit","Stock Balance","Total Value"], sum_rows),
+                        ("Payments",       ["Date","Product","Description","Amount","Notes"], pay_rows),
+                        ("Drop Log",       ["Date","Store","Product","Qty","Note","Timestamp"], drop_rows),
+                        ("Shift Sale",     ["Store","Date","Shift","Product","Drop","Start","End","Sale"], shift_rows),
+                        ("Storage Count",  ["Store","Product","Date","Must In Hand","Received","Dropped","Exchange","Note"], stor_rows),
+                    ]
+                    prog = st.progress(0.0)
+                    done = 0
+                    for title, header, rows in tables:
+                        _write_ws(sheet, title, header, rows)
+                        done += 1
+                        prog.progress(done/len(tables), text=f"Synced: {title} ({len(rows)} rows)")
+                    st.success(f"✅ All data pushed to your Google Sheet! "
+                               f"({sum(len(r) for _,_,r in tables)} rows across {len(tables)} tabs)")
+                    st.markdown(f"[📄 Open your Google Sheet](https://docs.google.com/spreadsheets/d/{gs_id})")
+                except Exception as e:
+                    msg = str(e)
+                    if "PERMISSION_DENIED" in msg or "permission" in msg.lower() or "403" in msg:
+                        st.error("❌ Permission denied. Share your Google Sheet with this email "
+                                 "(as Editor): the-stock-app@my-stock-project-494511.iam.gserviceaccount.com")
+                    elif "not found" in msg.lower() or "404" in msg:
+                        st.error("❌ Sheet not found. Check the Sheet ID is correct.")
+                    else:
+                        st.error(f"❌ Sync failed: {msg}")
