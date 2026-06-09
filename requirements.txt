@@ -2,3 +2,5 @@ streamlit
 supabase
 openpyxl
 pandas
+gspread>=6.0.0
+google-auth
